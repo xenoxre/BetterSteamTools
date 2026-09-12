@@ -32,44 +32,84 @@ LONG CALLBACK VehThunk(PEXCEPTION_POINTERS exceptionInfo) {
         OSTP_LOG_TRACE("VehThunk: no handler installed");
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    if (!exceptionInfo || !exceptionInfo->ExceptionRecord || !exceptionInfo->ContextRecord) {
-        OSTP_LOG_DEBUG("VehThunk: incomplete exception context (info={:#x}, record={:#x}, context={:#x})",
-                       reinterpret_cast<uintptr_t>(exceptionInfo),
-                       reinterpret_cast<uintptr_t>(exceptionInfo ? exceptionInfo->ExceptionRecord : nullptr),
-                       reinterpret_cast<uintptr_t>(exceptionInfo ? exceptionInfo->ContextRecord : nullptr));
+
+    if (!exceptionInfo ||
+        !exceptionInfo->ExceptionRecord ||
+        !exceptionInfo->ContextRecord) {
+        OSTP_LOG_DEBUG(
+            "VehThunk: incomplete exception context "
+            "(info={:#x}, record={:#x}, context={:#x})",
+            reinterpret_cast<uintptr_t>(exceptionInfo),
+            reinterpret_cast<uintptr_t>(
+                exceptionInfo ? exceptionInfo->ExceptionRecord : nullptr),
+            reinterpret_cast<uintptr_t>(
+                exceptionInfo ? exceptionInfo->ContextRecord : nullptr));
+
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
     Context context(exceptionInfo->ContextRecord);
+
     const DWORD code = exceptionInfo->ExceptionRecord->ExceptionCode;
     const ExceptionKind kind = FromWindowsExceptionCode(code);
-    OSTP_LOG_TRACE("VehThunk: exception code=0x{:08X} kind={} ip={:#x}",
-                   code, ToString(kind), context.InstructionPointer());
+
+    OSTP_LOG_TRACE(
+        "VehThunk: exception code=0x{:08X} kind={} ip={:#x}",
+        code,
+        ToString(kind),
+        context.InstructionPointer());
 
     const bool handled = g_handler(
         kind,
         context);
-    OSTP_LOG_TRACE("VehThunk: {} at ip={:#x}", handled ? "handled" : "continued", context.InstructionPointer());
-    return handled ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+
+    OSTP_LOG_TRACE(
+        "VehThunk: {} at ip={:#x}",
+        handled ? "handled" : "continued",
+        context.InstructionPointer());
+
+    return handled
+        ? EXCEPTION_CONTINUE_EXECUTION
+        : EXCEPTION_CONTINUE_SEARCH;
 }
 
 PCONTEXT AsWindowsContext(void* nativeContext) {
     return static_cast<PCONTEXT>(nativeContext);
 }
 
+/*
+ * MinGW-compatible version of the original __try/__except read.
+ *
+ * ReadProcessMemory is used on the current process so an invalid/unreadable
+ * address simply causes the function to fail instead of generating an
+ * exception that MinGW cannot handle with MSVC's __try/__except syntax.
+ */
 bool TryReadStackSlotRaw(uintptr_t address, uint64_t& out) {
-    __try {
-        out = *reinterpret_cast<const uint64_t*>(address);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    if (address == 0) {
         return false;
     }
+
+    SIZE_T bytesRead = 0;
+
+    const BOOL result = ReadProcessMemory(
+        GetCurrentProcess(),
+        reinterpret_cast<const void*>(address),
+        &out,
+        sizeof(out),
+        &bytesRead);
+
+    return result != FALSE && bytesRead == sizeof(out);
 }
 
 bool TryReadStackSlot(uintptr_t address, uint64_t& out) {
-    if (TryReadStackSlotRaw(address, out)) return true;
+    if (TryReadStackSlotRaw(address, out)) {
+        return true;
+    }
 
-    OSTP_LOG_TRACE("TryReadStackSlot({:#x}) failed", address);
+    OSTP_LOG_TRACE(
+        "TryReadStackSlot({:#x}) failed",
+        address);
+
     return false;
 }
 
@@ -77,36 +117,60 @@ bool TryReadStackSlot(uintptr_t address, uint64_t& out) {
 
 uint64_t Context::InstructionPointer() const {
     PCONTEXT context = AsWindowsContext(nativeContext_);
+
     if (!context) {
-        OSTP_LOG_TRACE("Context::InstructionPointer: native context is null");
+        OSTP_LOG_TRACE(
+            "Context::InstructionPointer: native context is null");
         return 0;
     }
+
     return context->Rip;
 }
 
 uint64_t Context::Argument(int index) const {
     PCONTEXT context = AsWindowsContext(nativeContext_);
+
     if (!context) {
-        OSTP_LOG_TRACE("Context::Argument({}): native context is null", index);
+        OSTP_LOG_TRACE(
+            "Context::Argument({}): native context is null",
+            index);
         return 0;
     }
 
     switch (index) {
-    case 1: return context->Rcx;
-    case 2: return context->Rdx;
-    case 3: return context->R8;
-    case 4: return context->R9;
+    case 1:
+        return context->Rcx;
+
+    case 2:
+        return context->Rdx;
+
+    case 3:
+        return context->R8;
+
+    case 4:
+        return context->R9;
+
     default: {
         if (index <= 0) {
-            OSTP_LOG_DEBUG("Context::Argument: invalid 1-based index {}", index);
+            OSTP_LOG_DEBUG(
+                "Context::Argument: invalid 1-based index {}",
+                index);
             return 0;
         }
-        const uintptr_t slot = context->Rsp + static_cast<uintptr_t>(index) * 8;
+
+        const uintptr_t slot =
+            context->Rsp + static_cast<uintptr_t>(index) * 8;
+
         uint64_t value = 0;
+
         if (!TryReadStackSlot(slot, value)) {
-            OSTP_LOG_TRACE("Context::Argument({}): stack slot {:#x} is unreadable", index, slot);
+            OSTP_LOG_TRACE(
+                "Context::Argument({}): stack slot {:#x} is unreadable",
+                index,
+                slot);
             return 0;
         }
+
         return value;
     }
     }
@@ -114,48 +178,75 @@ uint64_t Context::Argument(int index) const {
 
 void Context::EnableSingleStep() {
     PCONTEXT context = AsWindowsContext(nativeContext_);
+
     if (!context) {
-        OSTP_LOG_TRACE("Context::EnableSingleStep: native context is null");
+        OSTP_LOG_TRACE(
+            "Context::EnableSingleStep: native context is null");
         return;
     }
+
     context->EFlags |= 0x100;
-    OSTP_LOG_TRACE("Context::EnableSingleStep: TF set at ip={:#x}", context->Rip);
+
+    OSTP_LOG_TRACE(
+        "Context::EnableSingleStep: TF set at ip={:#x}",
+        context->Rip);
 }
 
 HandlerHandle AddVectoredHandler(Handler handler) {
     if (!handler) {
-        OSTP_LOG_DEBUG("AddVectoredHandler: handler is null");
+        OSTP_LOG_DEBUG(
+            "AddVectoredHandler: handler is null");
         return nullptr;
     }
+
     if (g_handle) {
-        OSTP_LOG_DEBUG("AddVectoredHandler: handler already installed");
+        OSTP_LOG_DEBUG(
+            "AddVectoredHandler: handler already installed");
         return nullptr;
     }
 
     g_handler = handler;
-    g_handle = AddVectoredExceptionHandler(1, VehThunk);
+
+    g_handle = AddVectoredExceptionHandler(
+        1,
+        VehThunk);
+
     if (!g_handle) {
-        OSTP_LOG_WARN("AddVectoredExceptionHandler failed (error={})", GetLastError());
+        OSTP_LOG_WARN(
+            "AddVectoredExceptionHandler failed (error={})",
+            GetLastError());
+
         g_handler = nullptr;
     } else {
-        OSTP_LOG_DEBUG("AddVectoredExceptionHandler installed handle={}", g_handle);
+        OSTP_LOG_DEBUG(
+            "AddVectoredExceptionHandler installed handle={}",
+            g_handle);
     }
+
     return g_handle;
 }
 
 void RemoveVectoredHandler(HandlerHandle handle) {
     if (!handle || handle != g_handle) {
-        OSTP_LOG_TRACE("RemoveVectoredHandler: ignoring stale handle {}", handle);
+        OSTP_LOG_TRACE(
+            "RemoveVectoredHandler: ignoring stale handle {}",
+            handle);
         return;
     }
 
     if (RemoveVectoredExceptionHandler(handle) == 0) {
-        OSTP_LOG_WARN("RemoveVectoredExceptionHandler failed (error={})", GetLastError());
+        OSTP_LOG_WARN(
+            "RemoveVectoredExceptionHandler failed (error={})",
+            GetLastError());
         return;
     }
+
     g_handle = nullptr;
     g_handler = nullptr;
-    OSTP_LOG_DEBUG("RemoveVectoredExceptionHandler removed handle={}", handle);
+
+    OSTP_LOG_DEBUG(
+        "RemoveVectoredExceptionHandler removed handle={}",
+        handle);
 }
 
 } // namespace OSTPlatform::Trap
